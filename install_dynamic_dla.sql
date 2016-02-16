@@ -43,7 +43,7 @@ CREATE TYPE dla_filter_ntt
 
 prompt Installing dla_ot type specification...
 
-CREATE TYPE dla_ot AS OBJECT
+CREATE TYPE dla_ot AUTHID CURRENT_USER AS OBJECT
 ( 
   atype ANYTYPE --<-- transient record type
 
@@ -299,7 +299,9 @@ CREATE PACKAGE dla_pkg AS
    , csfrm     PLS_INTEGER
    , schema    VARCHAR2(30)
    , type      ANYTYPE
-   , name      VARCHAR2(30)
+   --This must be 31, not 30.
+   --For weird column names ANYTYPE.GetAttrElemInfo returns 31 bytes instead of 30.
+   , name      VARCHAR2(31)
    , version   VARCHAR2(30)
    , attr_cnt  PLS_INTEGER
    , attr_type ANYTYPE
@@ -346,8 +348,13 @@ CREATE TYPE BODY dla_ot AS
 
       FOR i IN 1 .. r_sql.column_cnt LOOP
 
-         v_rtype.AddAttr( r_sql.description(i).col_name,
-                          CASE 
+         v_rtype.AddAttr(
+                          --Column names can be over 30 bytes if an expression was used.
+                          --If the length is more than 30 the query will generate the error
+                          --"ORA-00902: invalid datatype" without a line number.
+                          --I'm not sure why or where it breaks, but this fixes it.
+                          substr(r_sql.description(i).col_name, 1, 30),
+                          CASE
                              --<>--
                              WHEN r_sql.description(i).col_type IN (1,96,11,208)
                              THEN DBMS_TYPES.TYPECODE_VARCHAR2
@@ -363,6 +370,12 @@ CREATE TYPE BODY dla_ot AS
                              --<>--
                              WHEN r_sql.description(i).col_type = 23 
                              THEN DBMS_TYPES.TYPECODE_RAW
+                             --<>--
+                             WHEN r_sql.description(i).col_type = 100
+                             THEN DBMS_TYPES.TYPECODE_BFLOAT
+                             --<>--
+                             WHEN r_sql.description(i).col_type = 101
+                             THEN DBMS_TYPES.TYPECODE_BDOUBLE
                              --<>--
                              WHEN r_sql.description(i).col_type = 180
                              THEN DBMS_TYPES.TYPECODE_TIMESTAMP
@@ -380,8 +393,18 @@ CREATE TYPE BODY dla_ot AS
                              THEN DBMS_TYPES.TYPECODE_TIMESTAMP_LTZ
                              --<>--
                           END,
-                          r_sql.description(i).col_precision,
-                          r_sql.description(i).col_scale,
+                          --Float and Number share the same col_type, 2.
+                          --Convert FLOAT to NUMBER by changing scale and precision.
+                          CASE
+                             WHEN r_sql.description(i).col_type = 2 AND r_sql.description(i).col_precision > 0 AND r_sql.description(i).col_scale = -127
+                             THEN 0
+                             ELSE r_sql.description(i).col_precision
+                          END,
+                          CASE
+                             WHEN r_sql.description(i).col_type = 2 AND r_sql.description(i).col_precision > 0 AND r_sql.description(i).col_scale = -127
+                             THEN -127
+                             ELSE r_sql.description(i).col_scale
+                          END,
                           CASE r_sql.description(i).col_type
                              WHEN 11 
                              THEN 32
@@ -475,10 +498,34 @@ CREATE TYPE BODY dla_ot AS
                   dla_pkg.r_sql.cursor, i, '', 32767 
                   );
             --<>--
+            WHEN DBMS_TYPES.TYPECODE_NVARCHAR2
+            THEN
+               DBMS_SQL.DEFINE_COLUMN(
+                  method4.r_sql.cursor, i, '', 32767
+                  );
+            --<>--
             WHEN DBMS_TYPES.TYPECODE_NUMBER
             THEN
                DBMS_SQL.DEFINE_COLUMN( 
                   dla_pkg.r_sql.cursor, i, CAST(NULL AS NUMBER) 
+                  );
+            --<FLOAT - convert to NUMBER.>--
+            WHEN 4
+            THEN
+               DBMS_SQL.DEFINE_COLUMN(
+                  method4.r_sql.cursor, i, CAST(NULL AS NUMBER)
+                  );
+            --<>--
+            WHEN DBMS_TYPES.TYPECODE_BFLOAT
+            THEN
+               DBMS_SQL.DEFINE_COLUMN(
+                  method4.r_sql.cursor, i, CAST(NULL AS BINARY_FLOAT)
+                  );
+            --<>--
+            WHEN DBMS_TYPES.TYPECODE_BDOUBLE
+            THEN
+               DBMS_SQL.DEFINE_COLUMN(
+                  method4.r_sql.cursor, i, CAST(NULL AS BINARY_DOUBLE)
                   );
             --<>--
             WHEN DBMS_TYPES.TYPECODE_DATE
@@ -559,20 +606,22 @@ CREATE TYPE BODY dla_ot AS
                    ) RETURN NUMBER IS
 
       TYPE rt_fetch_attributes IS RECORD
-      ( v2_column    VARCHAR2(32767)
-      , num_column   NUMBER
-      , date_column  DATE
-      , clob_column  CLOB
-      , raw_column   RAW(32767)
-      , raw_error    NUMBER
-      , raw_length   INTEGER
-      , ids_column   INTERVAL DAY TO SECOND
-      , iym_column   INTERVAL YEAR TO MONTH
-      , ts_column    TIMESTAMP
-      , tstz_column  TIMESTAMP WITH TIME ZONE
-      , tsltz_column TIMESTAMP WITH LOCAL TIME ZONE
-      , cvl_offset   INTEGER := 0
-      , cvl_length   INTEGER
+      ( v2_column      VARCHAR2(32767)
+      , num_column     NUMBER
+      , bfloat_column  BINARY_FLOAT
+      , bdouble_column BINARY_DOUBLE
+      , date_column    DATE
+      , clob_column    CLOB
+      , raw_column     RAW(32767)
+      , raw_error      NUMBER
+      , raw_length     INTEGER
+      , ids_column     INTERVAL DAY TO SECOND
+      , iym_column     INTERVAL YEAR TO MONTH
+      , ts_column      TIMESTAMP(9)
+      , tstz_column    TIMESTAMP(9) WITH TIME ZONE
+      , tsltz_column   TIMESTAMP(9) WITH LOCAL TIME ZONE
+      , cvl_offset     INTEGER := 0
+      , cvl_length     INTEGER
       );
       r_fetch rt_fetch_attributes;
       r_meta  dla_pkg.rt_anytype_metadata;
@@ -618,12 +667,40 @@ CREATE TYPE BODY dla_ot AS
                      );
                   rws.SetVarchar2( r_fetch.v2_column );
                --<>--
+               WHEN DBMS_TYPES.TYPECODE_NVARCHAR2
+               THEN
+                  DBMS_SQL.COLUMN_VALUE(
+                     dla_pkg.r_sql.cursor, i, r_fetch.v2_column
+                     );
+                  rws.SetNVarchar2( r_fetch.v2_column );
+               --<>--
                WHEN DBMS_TYPES.TYPECODE_NUMBER
                THEN
                   DBMS_SQL.COLUMN_VALUE(
                      dla_pkg.r_sql.cursor, i, r_fetch.num_column 
                      );
                   rws.SetNumber( r_fetch.num_column );
+               --<FLOAT - convert to NUMBER.>--
+               WHEN 4
+               THEN
+                  DBMS_SQL.COLUMN_VALUE(
+                     dla_pkg.r_sql.cursor, i, r_fetch.num_column
+                     );
+                  rws.SetNumber( r_fetch.num_column );
+               --<>--
+               WHEN DBMS_TYPES.TYPECODE_BFLOAT
+               THEN
+                  DBMS_SQL.COLUMN_VALUE(
+                     dla_pkg.r_sql.cursor, i, r_fetch.bfloat_column
+                     );
+                  rws.SetBFloat( r_fetch.bfloat_column );
+               --<>--
+               WHEN DBMS_TYPES.TYPECODE_BDOUBLE
+               THEN
+                  DBMS_SQL.COLUMN_VALUE(
+                     dla_pkg.r_sql.cursor, i, r_fetch.bdouble_column
+                     );
+                  rws.SetBDouble( r_fetch.bdouble_column );
                --<>--
                WHEN DBMS_TYPES.TYPECODE_DATE
                THEN
